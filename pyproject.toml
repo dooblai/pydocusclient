@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "docus"
+version = "0.1.0"
+description = "Pytest client for the Docus test recorder service"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["pytest>=7"]
+classifiers = [
+  "Framework :: Pytest",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Operating System :: OS Independent",
+  "Topic :: Software Development :: Testing",
+]
+
+[project.urls]
+Homepage = "https://github.com/dooblai/pydocusclient"
+Source = "https://github.com/dooblai/pydocusclient"
+Issues = "https://github.com/dooblai/pydocusclient/issues"
+
+[project.entry-points.pytest11]
+pydocusclient = "pytest_recorder_client"
+
+[project.scripts]
+pydocus-resend = "pytest_recorder_client:resend_main"
+test-recorder-resend = "pytest_recorder_client:resend_main"
+
+[tool.setuptools]
+py-modules = ["pytest_recorder_client"]
