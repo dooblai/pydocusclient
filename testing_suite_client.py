@@ -87,7 +87,8 @@ class ClientTests(unittest.TestCase):
             spool = root / "spool"
             env = dict(os.environ, TEST_RECORDER_URL="http://127.0.0.1:1",
                        TEST_RECORDER_REPO="github.com/acme/widget",
-                       TEST_RECORDER_SPOOL_DIR=str(spool))
+                       TEST_RECORDER_SPOOL_DIR=str(spool),
+                       TEST_RECORDER_SESSION_ID="00000000-0000-4000-8000-000000000001")
             result = subprocess.run(
                 [sys.executable, "-m", "pytest", "-q", str(root / "test_sample.py")],
                 cwd=root, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -95,7 +96,9 @@ class ClientTests(unittest.TestCase):
             files = list(spool.glob("*.json"))
             self.assertEqual(len(files), 1)
             events = json.loads(files[0].read_text())["events"]
+            self.assertEqual(events[0]["id"], "00000000-0000-4000-8000-000000000001")
             statuses = {event["status"] for event in events if event["type"] == "result"}
+            self.assertTrue(all(event["sid"] == events[0]["id"] for event in events if event["type"] == "result"))
             self.assertEqual(statuses, {"passed", "failed", "skipped"})
             failed = next(event for event in events if event.get("status") == "failed")
             self.assertIn("42", failed["stdout"])

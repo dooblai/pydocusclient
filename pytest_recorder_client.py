@@ -10,7 +10,7 @@ import socket
 import subprocess
 import sys
 import urllib.request
-from uuid import uuid4
+from uuid import UUID, uuid4
 import warnings
 
 
@@ -65,6 +65,7 @@ def pytest_addoption(parser):
     group = parser.getgroup("test-recorder")
     group.addoption("--recorder-url", default=None, help="Test Recorder service URL")
     group.addoption("--recorder-repo", default=None, help="Canonical repository ID")
+    group.addoption("--recorder-session-id", default=None, help="UUID for this pytest session")
     group.addoption("--recorder-spool", default=None, help="Directory for unsent result batches")
 
 
@@ -84,7 +85,8 @@ class RecorderPlugin:
         self.spool = Path(config.getoption("--recorder-spool") or
                           os.getenv("TEST_RECORDER_SPOOL_DIR") or
                           self.root / ".test-recorder" / "spool")
-        self.sid = str(uuid4())
+        session_id = config.getoption("--recorder-session-id") or os.getenv("TEST_RECORDER_SESSION_ID")
+        self.sid = str(UUID(session_id)) if session_id else str(uuid4())
         self.items = {}
         self.reports = {}
         self.error = None

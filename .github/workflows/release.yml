@@ -18,8 +18,29 @@ jobs:
         run: python -m pip install --upgrade . build
       - name: Test
         run: python testing_suite_client.py
-      - name: Build wheel and source distribution
-        run: python -m build
+      - name: Verify tag and build clean distributions
+        run: |
+          python - <<PY
+          import os
+          import tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          if tag != "v" + version:
+              raise SystemExit(f"Release tag {tag} does not match package version {version}")
+          PY
+          rm -rf dist build
+          python -m build
+          python - <<PY
+          import tomllib
+          from pathlib import Path
+          version = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          files = sorted(path.name for path in Path("dist").iterdir())
+          if len(files) != 2 or any(not name.startswith("docus-" + version) for name in files):
+              raise SystemExit(f"Unexpected distribution files: {files}")
+          print("Publishing:", *files)
+          PY
+
       - uses: actions/upload-artifact@v4
         with:
           name: distributions

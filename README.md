@@ -17,6 +17,11 @@ token. Set `TEST_RECORDER_REPO` to the canonical Git repository identifier;
 otherwise the plugin uses `GITHUB_REPOSITORY` or Git origin. The optional
 `TEST_RECORDER_ACTOR` overrides the current user.
 
+Each pytest invocation has a UUID session ID. The client generates one unless
+`TEST_RECORDER_SESSION_ID` or `--recorder-session-id` supplies a UUID. Use a
+fresh UUID for each distinct run; spooled retries keep the original ID. The
+service lists sessions by project and shows their individual results.
+
 The plugin records collected tests, test results, pytest phase durations,
 captured output, Git commit and branch, and a session ID. It sends a batch
 at session end. If delivery fails, pytest results are unchanged and the batch
@@ -46,7 +51,7 @@ JSON event format directly to the service.
    `docus`: owner `dooblai`, repository `pydocusclient`,
    workflow filename `release.yml`, environment `pypi`. This must match
    `.github/workflows/release.yml` exactly.
-5. Push a version tag such as `v0.1.1`, then publish a GitHub Release for
+5. Push a version tag such as `v0.1.2`, then publish a GitHub Release for
    that tag. The release workflow builds a wheel and source distribution and
    publishes them using GitHub OIDC. No long lived PyPI API token is needed.
 6. Verify with `pip install docus` in a fresh environment.
