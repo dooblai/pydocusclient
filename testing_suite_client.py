@@ -63,7 +63,7 @@ class ClientTests(unittest.TestCase):
             self.skipTest("tomllib requires Python 3.11")
         root = Path(__file__).resolve().parent
         metadata = tomllib.loads((root / "pyproject.toml").read_text())
-        self.assertEqual(metadata["project"]["name"], "pydocusclient")
+        self.assertEqual(metadata["project"]["name"], "docus")
         self.assertEqual(metadata["project"]["entry-points"]["pytest11"]["pydocusclient"],
                          "pytest_recorder_client")
         self.assertTrue((root / metadata["project"]["readme"]).is_file())
@@ -81,7 +81,7 @@ class ClientTests(unittest.TestCase):
                 "import pytest",
                 "def test_ok(): pass",
                 "def test_bad(): print(42); assert False",
-                "@pytest.mark.skip(reason=42)",
+                "@pytest.mark.skip(reason='exercise skip')",
                 "def test_skip(): pass",
                 ""]))
             spool = root / "spool"
