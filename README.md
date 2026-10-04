@@ -12,8 +12,10 @@ TEST_RECORDER_URL=https://recorder.example.com pytest
 ```
 
 The plugin stays inactive until `TEST_RECORDER_URL` or `--recorder-url` is
-provided. Set `TEST_RECORDER_API_TOKEN` when the service requires a bearer
-token. Set `TEST_RECORDER_REPO` to the canonical Git repository identifier;
+provided. Optionally set `TEST_RECORDER_API_TOKEN` to a JWT containing a
+nonempty `sub` claim. The service records that claim as the session and result
+`user`; it does not verify signatures or expiration yet. Set
+`TEST_RECORDER_REPO` to the canonical Git repository identifier;
 otherwise the plugin uses `GITHUB_REPOSITORY` or Git origin. The optional
 `TEST_RECORDER_ACTOR` overrides the current user.
 
@@ -51,7 +53,7 @@ JSON event format directly to the service.
    `docus`: owner `dooblai`, repository `pydocusclient`,
    workflow filename `release.yml`, environment `pypi`. This must match
    `.github/workflows/release.yml` exactly.
-5. Push a version tag such as `v0.1.2`, then publish a GitHub Release for
+5. Push a version tag such as `v0.1.3`, then publish a GitHub Release for
    that tag. The release workflow builds a wheel and source distribution and
    publishes them using GitHub OIDC. No long lived PyPI API token is needed.
 6. Verify with `pip install docus` in a fresh environment.

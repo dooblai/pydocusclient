@@ -36,6 +36,18 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(adapter.events[0]["stdout"], "oops")
         adapter._record("test_sample.py::test_bad", [report("call", "passed", xfail="expected")])
         self.assertEqual(adapter.events[1]["status"], "xpassed")
+        setup = report("setup", "passed")
+        call = report("call", "passed")
+        teardown = report("teardown", "passed")
+        setup.sections = [("Captured stderr setup", "alpha\n")]
+        call.sections = setup.sections + [("Captured stderr call", "beta\n")]
+        teardown.sections = call.sections + [("Captured stderr teardown", "gamma\n")]
+        setup.capstderr = "alpha\n"
+        call.capstderr = "alpha\nbeta\n"
+        teardown.capstderr = "alpha\nbeta\ngamma\n"
+        adapter._record("test_sample.py::test_bad", [setup, call, teardown])
+        self.assertEqual(adapter.events[2]["stderr"], "alpha\nbeta\ngamma\n")
+
 
     def test_delivery_failure_spools_batch(self):
         with tempfile.TemporaryDirectory() as directory:

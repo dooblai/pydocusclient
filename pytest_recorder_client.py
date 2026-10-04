@@ -146,10 +146,20 @@ class RecorderPlugin:
         at = lambda seconds: datetime.fromtimestamp(seconds, timezone.utc).isoformat(timespec="microseconds")
         output = {}
         for key, field in (("stdout", "capstdout"), ("stderr", "capstderr")):
-            value = chr(10).join(getattr(report, field, "") for report in reports
-                                 if getattr(report, field, ""))
+            fragments = []
+            for report in reports:
+                sections = getattr(report, "sections", None)
+                if sections is None:
+                    captured = getattr(report, field, "")
+                    if captured:
+                        fragments.append(captured)
+                else:
+                    fragments.extend(content for heading, content in sections
+                                     if heading == "Captured " + key + " " + report.when)
+            value = "".join(fragments)
             output[key] = value[-65536:] if value else None
             output[key + "_truncated"] = len(value) > 65536
+
         trace = chr(10).join(report.longreprtext for report in failures
                              if getattr(report, "longreprtext", ""))
         self.events.append({
