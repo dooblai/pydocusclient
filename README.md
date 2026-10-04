@@ -24,10 +24,14 @@ Each pytest invocation has a UUID session ID. The client generates one unless
 fresh UUID for each distinct run; spooled retries keep the original ID. The
 service lists sessions by project and shows their individual results.
 
-The plugin records collected tests, test results, pytest phase durations,
-captured output, Git commit and branch, and a session ID. It sends a batch
-at session end. If delivery fails, pytest results are unchanged and the batch
-is saved under `.test-recorder/spool`. Retry with:
+The plugin records collected tests, results, pytest phase durations, captured
+output, Git commit and branch, and a session ID. With pytest-xdist, workers
+share collection metadata and only the controller publishes the session.
+Delivery uses ordered chunks of at most 100 events or 1 MB. The HTTP timeout
+defaults to 60 seconds; set `TEST_RECORDER_TIMEOUT` or
+`--recorder-timeout` to change it. If delivery is unconfirmed, only the
+uncertain and remaining chunks are saved under `.test-recorder/spool`.
+Retry with:
 
 ```sh
 TEST_RECORDER_URL=https://recorder.example.com pydocus-resend
@@ -35,7 +39,7 @@ TEST_RECORDER_URL=https://recorder.example.com pydocus-resend
 
 To keep a test identity across a pytest function rename, mark it with
 `@pytest.mark.record_id("logical-name")`. Parameter IDs should remain stable.
-Output and failure fields are capped at 64 KiB each; the batch indicates when
+Output and failure fields are capped at 64 KiB each; the result indicates when
 truncation occurred.
 
 The Docus service is developed at
@@ -53,7 +57,7 @@ JSON event format directly to the service.
    `docus`: owner `dooblai`, repository `pydocusclient`,
    workflow filename `release.yml`, environment `pypi`. This must match
    `.github/workflows/release.yml` exactly.
-5. Push a version tag such as `v0.1.3`, then publish a GitHub Release for
+5. Push a version tag such as `v0.1.4`, then publish a GitHub Release for
    that tag. The release workflow builds a wheel and source distribution and
    publishes them using GitHub OIDC. No long lived PyPI API token is needed.
 6. Verify with `pip install docus` in a fresh environment.

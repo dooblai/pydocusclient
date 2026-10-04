@@ -49,6 +49,24 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(adapter.events[2]["stderr"], "alpha\nbeta\ngamma\n")
 
 
+    def test_xdist_crash_report_without_worker_metadata(self):
+        adapter = client.RecorderPlugin.__new__(client.RecorderPlugin)
+        adapter.root = Path.cwd()
+        adapter.repository = "github.com/acme/widget"
+        adapter.distributed = True
+        adapter.items = {}
+        adapter.sid = "crashed-run"
+        adapter.events = [{"type": "session_start", "commit": None}]
+        report = SimpleNamespace(when="???", outcome="failed", failed=True,
+                                 skipped=False, passed=False, sections=[],
+                                 longreprtext="worker crashed")
+        with warnings.catch_warnings(record=True):
+            adapter._record("tests/test_crash.py::test_case", [report])
+        self.assertEqual(adapter.events[-1]["status"], "error")
+        self.assertEqual(adapter.events[-1]["test"]["name"], "test_case")
+        self.assertEqual(adapter.events[-1]["duration_s"], 0.0)
+
+
     def test_delivery_failure_spools_batch(self):
         with tempfile.TemporaryDirectory() as directory:
             adapter = client.RecorderPlugin.__new__(client.RecorderPlugin)
@@ -64,9 +82,134 @@ class ClientTests(unittest.TestCase):
             with patch.object(client, "post_batch", side_effect=OSError("offline")):
                 with warnings.catch_warnings(record=True):
                     adapter.pytest_sessionfinish(None, 0)
-            payload = json.loads((Path(directory) / "offline-run.json").read_text())
-            self.assertEqual(payload["events"][-1]["type"], "session_finish")
+            files = list(Path(directory).glob("offline-run-*.json"))
+            self.assertEqual(len(files), 1)
+            payload = json.loads(files[0].read_text())
+            self.assertEqual(payload["chunks"][-1]["events"][-1]["type"], "session_finish")
+            self.assertTrue(payload["uncertain_first_chunk"])
             self.assertEqual(adapter.error, "offline")
+
+    def test_xdist_controller_owns_one_complete_session(self):
+        try:
+            import pytest
+            import xdist
+        except ImportError as error:
+            self.skipTest(str(error))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "test_parallel.py").write_text(chr(10).join([
+                "import pytest",
+                "@pytest.mark.parametrize(" + chr(39) + "n" + chr(39) + ", range(45))",
+                "def test_many(n): assert n >= 0",
+                "@pytest.mark.record_id(" + chr(39) + "stable_case" + chr(39) + ")",
+                "def test_renamed(): pass",
+                "@pytest.mark.skip(reason=" + chr(39) + "skip" + chr(39) + ")",
+                "def test_skip(): pass",
+                "@pytest.mark.xfail(reason=" + chr(39) + "expected" + chr(39) + ")",
+                "def test_xfail(): assert False",
+                "def test_fail(): assert False",
+                "def test_plain(): pass",
+                ""]))
+            def run(mode):
+                spool = root / ("spool-" + mode)
+                sid = "00000000-0000-4000-8000-" + ("000000000001" if mode == "serial" else "000000000002")
+                env = dict(os.environ, TEST_RECORDER_URL="http://127.0.0.1:1",
+                           TEST_RECORDER_REPO="github.com/acme/widget",
+                           TEST_RECORDER_SPOOL_DIR=str(spool), TEST_RECORDER_SESSION_ID=sid)
+                command = [sys.executable, "-m", "pytest", "-q", "--tb=no", str(root / "test_parallel.py")]
+                if mode == "xdist":
+                    command.extend(["-n", "3"])
+                result = subprocess.run(command, cwd=root, env=env, text=True,
+                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                files = list(spool.glob("*.json"))
+                self.assertEqual(len(files), 1, result.stdout + result.stderr)
+                pending = json.loads(files[0].read_text())
+                return [event for chunk in pending["chunks"] for event in chunk["events"]]
+            serial = run("serial")
+            parallel = run("xdist")
+            for events in (serial, parallel):
+                self.assertEqual(sum(event["type"] == "session_start" for event in events), 1)
+                self.assertEqual(sum(event["type"] == "session_finish" for event in events), 1)
+                self.assertEqual(sum(event["type"] == "observe" for event in events), 50)
+                results = [event for event in events if event["type"] == "result"]
+                self.assertEqual(len(results), 50)
+                self.assertEqual(len({event["nodeid"] for event in results}), 50)
+                self.assertEqual(events[-1]["collected"], 50)
+                self.assertEqual(events[-1]["exit_code"], 1)
+                self.assertEqual({event["status"] for event in results},
+                                 {"passed", "failed", "skipped", "xfailed"})
+            serial_tests = {event["nodeid"]: event["test"] for event in serial if event["type"] == "result"}
+            parallel_tests = {event["nodeid"]: event["test"] for event in parallel if event["type"] == "result"}
+            self.assertEqual(serial_tests, parallel_tests)
+            self.assertEqual(parallel_tests["test_parallel.py::test_renamed"]["name"], "stable_case")
+
+
+    def test_large_delivery_chunks_and_resumable_timeout(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def adapter(sid, spool):
+                recorder = client.RecorderPlugin.__new__(client.RecorderPlugin)
+                recorder.sid = sid
+                recorder.items = {str(i): {} for i in range(500)}
+                recorder.reports = {}
+                recorder.completed = []
+                recorder.distributed = False
+                recorder.events = [{"type": "session_start", "id": sid}] + [
+                    {"type": "result", "id": str(i), "stdout": "x" * 60000}
+                    for i in range(500)]
+                recorder.spool = spool
+                recorder.url = "http://127.0.0.1:1"
+                recorder.token = None
+                recorder.timeout = 0.1
+                recorder.error = None
+                return recorder
+            delivered = set()
+            calls = []
+            def accept(url, token, payload, timeout):
+                calls.append(payload)
+                self.assertLessEqual(len(payload["events"]), client.MAX_BATCH_EVENTS)
+                self.assertLessEqual(len(json.dumps(payload).encode()), client.MAX_BATCH_BYTES)
+                delivered.update(event["id"] for event in payload["events"]
+                                 if event["type"] == "result")
+            success = adapter("success", root / "success-spool")
+            with patch.object(client, "post_batch", side_effect=accept):
+                success.pytest_sessionfinish(None, 0)
+            self.assertEqual(len(delivered), 500)
+            self.assertGreater(len(calls), 1)
+            self.assertFalse(list(success.spool.glob("*.json")))
+            delivered.clear()
+            calls.clear()
+            pending = adapter("timeout", root / "timeout-spool")
+            def timeout_after_store(url, token, payload, timeout):
+                accept(url, token, payload, timeout)
+                if len(calls) == 2:
+                    raise TimeoutError("response delayed after storage")
+            with patch.object(client, "post_batch", side_effect=timeout_after_store):
+                with warnings.catch_warnings(record=True):
+                    pending.pytest_sessionfinish(None, 0)
+            self.assertEqual(len(list(pending.spool.glob("*.json"))), 1)
+            with patch.object(client, "post_batch", side_effect=accept):
+                client.resend_main(["--url", pending.url, "--spool", str(pending.spool)])
+            self.assertEqual(len(delivered), 500)
+            self.assertFalse(list(pending.spool.glob("*.json")))
+
+
+    def test_legacy_spool_is_replayed_in_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "old-session.json"
+            events = [{"type": "session_start", "id": "old-session"},
+                      {"type": "result", "id": "old-result"},
+                      {"type": "session_finish", "sid": "old-session"}]
+            path.write_text(json.dumps({"events": events}))
+            sent = []
+            def accept(url, token, payload, timeout):
+                sent.extend(payload["events"])
+            with patch.object(client, "post_batch", side_effect=accept):
+                client.resend_main(["--url", "http://127.0.0.1:1", "--spool", directory])
+            self.assertEqual(sent, events)
+            self.assertFalse(path.exists())
+
 
     def test_release_metadata(self):
         try:
@@ -107,7 +250,7 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
             files = list(spool.glob("*.json"))
             self.assertEqual(len(files), 1)
-            events = json.loads(files[0].read_text())["events"]
+            events = [event for chunk in json.loads(files[0].read_text())["chunks"] for event in chunk["events"]]
             self.assertEqual(events[0]["id"], "00000000-0000-4000-8000-000000000001")
             statuses = {event["status"] for event in events if event["type"] == "result"}
             self.assertTrue(all(event["sid"] == events[0]["id"] for event in events if event["type"] == "result"))
