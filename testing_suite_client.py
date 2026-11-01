@@ -260,5 +260,112 @@ class ClientTests(unittest.TestCase):
             self.assertEqual(events[-1]["type"], "session_finish")
 
 
+FAKE_BOTO3 = chr(10).join([
+    "import json, os",
+    "class _Client:",
+    "    def put_object(self, **kw):",
+    "        if os.environ.get('FAKE_S3_FAIL'): raise RuntimeError('S3 down')",
+    "        kw['Body'] = kw['Body'].hex()",
+    "        open(os.environ['FAKE_S3_LOG'], 'a').write(json.dumps({'call': 'put_object', **kw}) + chr(10))",
+    "class Session:",
+    "    def __init__(self, profile_name=None, region_name=None):",
+    "        open(os.environ['FAKE_S3_LOG'], 'a').write(json.dumps({'call': 'Session', 'profile_name': profile_name,",
+    "                                                                 'region_name': region_name}) + chr(10))",
+    "    def client(self, name): return _Client()",
+    ""])
+
+
+class S3TargetTests(unittest.TestCase):
+    """The S3 target (docus.conf): found, parsed, one gzipped object per session, spooled and resent on failure."""
+
+    def test_config_lookup_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home, project = root / "home", root / "umbrella" / "sub"
+            project.mkdir(parents=True)
+            (home / ".config" / "docus").mkdir(parents=True)
+            (home / ".config" / "docus" / "docus.conf").write_text("s3_uri = s3://home-bucket/x\n")
+            env = {k: v for k, v in os.environ.items() if k != "DOCUS_CONFIG"}
+            with patch.dict(os.environ, env, clear=True), patch.object(Path, "home", return_value=home):
+                self.assertEqual(client.find_config(project), home / ".config" / "docus" / "docus.conf")
+                (root / "umbrella" / ".profile").mkdir()
+                umbrella = root / "umbrella" / ".profile" / "docus.conf"
+                umbrella.write_text("s3_uri = s3://umbrella-bucket/y\n")
+                self.assertEqual(client.find_config(project), umbrella)  # a parent's .profile/ wins over home
+                explicit = root / "explicit.conf"
+                explicit.write_text("s3_uri = s3://explicit/z\n")
+                with patch.dict(os.environ, {"DOCUS_CONFIG": str(explicit)}):
+                    self.assertEqual(client.find_config(project), explicit)
+
+    def test_config_parsing_and_key(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "docus.conf"
+            path.write_text("# the team's recorder\ns3_uri = s3://boltu-vectorbot-docus/robot1/  # path\n"
+                            "aws_profile = 'robot1'\n")
+            settings = client.load_config(path)
+            self.assertEqual((settings["bucket"], settings["prefix"], settings["profile"], settings["targets"]),
+                             ("boltu-vectorbot-docus", "robot1", "robot1", {"s3"}))
+            path.write_text("aws_profile = robot1\n")
+            self.assertIsNone(client.load_config(path))  # no s3_uri: no S3 target
+            path.write_text("s3_uri = http://nope\n")
+            with self.assertRaises(ValueError):
+                client.load_config(path)
+        key = client.s3_key("robot1", "github.com/acme/widget", "2026-10-31T21:05:09.123456+00:00", "abc")
+        self.assertEqual(key, "robot1/sessions/repo=github.com__acme__widget/date=2026-10-31/20261031T210509_abc.json.gz")
+
+    def _run(self, root, env):
+        return subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", str(root / "test_sample.py")],
+                              cwd=root, env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    def _setup(self, root):
+        (root / "test_sample.py").write_text("def test_ok(): pass\ndef test_bad(): assert False\n")
+        (root / "fake").mkdir()
+        (root / "fake" / "boto3.py").write_text(FAKE_BOTO3)
+        (root / "docus.conf").write_text("s3_uri = s3://bucket-x/team\naws_profile = robot1\n")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("TEST_RECORDER")}
+        env.update(DOCUS_CONFIG=str(root / "docus.conf"), FAKE_S3_LOG=str(root / "s3.log"),
+                   PYTHONPATH=str(root / "fake") + os.pathsep + env.get("PYTHONPATH", ""),
+                   TEST_RECORDER_REPO="github.com/acme/widget", TEST_RECORDER_SPOOL_DIR=str(root / "spool"),
+                   TEST_RECORDER_SESSION_ID="00000000-0000-4000-8000-000000000002")
+        return env
+
+    def test_session_uploaded_as_one_object(self):
+        import gzip
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = self._setup(root)
+            result = self._run(root, env)  # no TEST_RECORDER_URL: S3 alone activates the recorder
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("saved to s3://bucket-x/team/sessions/repo=github.com__acme__widget/", result.stdout)
+            calls = [json.loads(line) for line in (root / "s3.log").read_text().splitlines()]
+            self.assertEqual(calls[0], {"call": "Session", "profile_name": "robot1", "region_name": None})
+            put = calls[1]
+            self.assertEqual((put["Bucket"], put["ContentEncoding"], put["ChecksumAlgorithm"]), ("bucket-x", "gzip", "SHA256"))
+            self.assertTrue(put["Key"].endswith("_00000000-0000-4000-8000-000000000002.json.gz"))
+            body = json.loads(gzip.decompress(bytes.fromhex(put["Body"])))
+            types = [event["type"] for event in body["events"]]
+            self.assertEqual((types[0], types[-1]), ("session_start", "session_finish"))
+            self.assertEqual({e["status"] for e in body["events"] if e["type"] == "result"}, {"passed", "failed"})
+            self.assertFalse((root / "spool").exists())
+
+    def test_failed_upload_is_spooled_then_resent(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = self._setup(root)
+            result = self._run(root, dict(env, FAKE_S3_FAIL="1"))
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            files = list((root / "spool").glob("*-s3-*.json"))
+            self.assertEqual(len(files), 1)
+            saved = json.loads(files[0].read_text())
+            self.assertEqual(saved["target"], "s3")
+            resend = subprocess.run([sys.executable, "-c", "import pytest_recorder_client as c; c.resend_main()",
+                                     "--spool", str(root / "spool")], cwd=root, env=env, text=True,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.assertEqual(resend.returncode, 0, resend.stdout + resend.stderr)
+            self.assertFalse(files[0].exists())
+            put = [json.loads(line) for line in (root / "s3.log").read_text().splitlines() if '"put_object"' in line]
+            self.assertEqual(put[-1]["Key"], saved["s3_key"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

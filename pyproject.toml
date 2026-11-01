@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "docus"
-version = "0.1.4"
+version = "0.1.5"
 description = "Pytest client for the Docus test recorder service"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -16,6 +16,9 @@ classifiers = [
   "Operating System :: OS Independent",
   "Topic :: Software Development :: Testing",
 ]
+
+[project.optional-dependencies]
+s3 = ["boto3"]   # the S3 target (docus.conf)
 
 [project.urls]
 Homepage = "https://github.com/dooblai/pydocusclient"

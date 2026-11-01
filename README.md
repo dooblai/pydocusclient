@@ -71,3 +71,23 @@ you intend to grant reuse rights.
 See the [PyPI trusted publishing guide](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/)
 and [Python packaging guide](https://packaging.python.org/en/latest/tutorials/packaging-projects/)
 for the current publishing steps.
+
+## Saving results to S3 instead of (or as well as) the service
+
+Put a `docus.conf` where the client finds it (the first that exists):
+
+1. the file named by `DOCUS_CONFIG`;
+2. `.profile/docus.conf` in the test root or any folder above it (e.g. a git-ignored `.profile/` in an umbrella repo);
+3. `~/.config/docus/docus.conf`.
+
+```
+s3_uri = s3://my-bucket/some/path     # where the sessions go
+aws_profile = my-profile              # optional: a profile in ~/.aws (boto3 reads it; this client never does)
+# region = us-east-1                  # optional
+# targets = s3,http                   # default s3 only: TEST_RECORDER_URL is then ignored
+```
+
+Each pytest session becomes one gzipped JSON object (`{"format": "docus-s3-v1", "session_id": ..., "events": [...]}`)
+at `<path>/sessions/repo=<repo>/date=<YYYY-MM-DD>/<time>_<session id>.json.gz` (partitions Athena understands); S3
+checks the upload's SHA-256. Needs `boto3` (`pip install "docus[s3]"`). A failed upload is saved in the spool folder and
+sent by `pydocus-resend` (the same config is found from the current folder, or `--config`).

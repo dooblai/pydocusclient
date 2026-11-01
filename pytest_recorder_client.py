@@ -1,7 +1,8 @@
-"""Installable pytest adapter for the Test Recorder HTTP API."""
+"""Installable pytest adapter for the Test Recorder HTTP API, and optionally an S3 bucket (docus.conf)."""
 from datetime import datetime, timezone
 import argparse
 import getpass
+import gzip
 import json
 import math
 import os
@@ -97,6 +98,75 @@ def post_batch(url, token, payload, timeout=DEFAULT_TIMEOUT):
         return json.load(response)
 
 
+CONFIG_NAME = "docus.conf"
+
+
+def find_config(root):
+    """Where the S3 settings are: $DOCUS_CONFIG, else .profile/docus.conf in the test root or a folder above it (a
+    git-ignored .profile/ in an umbrella repo covers its subprojects), else ~/.config/docus/docus.conf."""
+    explicit = os.getenv("DOCUS_CONFIG")
+    if explicit:
+        return Path(explicit) if Path(explicit).is_file() else None
+    root = Path(root).resolve()
+    for folder in (root, *root.parents):
+        candidate = folder / ".profile" / CONFIG_NAME
+        if candidate.is_file():
+            return candidate
+    candidate = Path.home() / ".config" / "docus" / CONFIG_NAME
+    return candidate if candidate.is_file() else None
+
+
+def load_config(path):
+    """`key = value` lines, `#` comments. Keys: s3_uri (s3://bucket/path), aws_profile (a profile name: boto3 reads the
+    credentials file itself; this client never opens it), region, targets ("s3", the default, or "s3,http")."""
+    values = {}
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        key, separator, value = line.partition("=")
+        if not separator:
+            raise ValueError(f"{path}: expected key = value, got {line!r}")
+        values[key.strip()] = value.strip().strip("'\"")
+    if "s3_uri" not in values:
+        return None
+    if not values["s3_uri"].startswith("s3://"):
+        raise ValueError(f"{path}: s3_uri must start with s3://")
+    bucket, _, prefix = values["s3_uri"][len("s3://"):].partition("/")
+    if not bucket:
+        raise ValueError(f"{path}: s3_uri has no bucket")
+    targets = {t.strip() for t in values.get("targets", "s3").split(",") if t.strip()}
+    if not targets <= {"s3", "http"}:
+        raise ValueError(f"{path}: targets must be s3 and/or http")
+    return {"bucket": bucket, "prefix": prefix.strip("/"), "profile": values.get("aws_profile") or None,
+            "region": values.get("region") or None, "targets": targets, "source": str(path)}
+
+
+def s3_key(prefix, repository, started_at, sid):
+    """One object per session, partitioned for Athena: <prefix>/sessions/repo=<repo>/date=<YYYY-MM-DD>/<time>_<sid>.json.gz"""
+    repo = re.sub(r"[^A-Za-z0-9._-]+", "__", repository)
+    stamp = started_at[:19].replace(":", "").replace("-", "")
+    key = f"sessions/repo={repo}/date={started_at[:10]}/{stamp}_{sid}.json.gz"
+    return f"{prefix}/{key}" if prefix else key
+
+
+def put_session_s3(settings, key, sid, events):
+    """Upload a session's events (gzipped JSON). boto3 finds the credentials from the profile name; S3 checks the
+    upload against its SHA-256. Re-sending the same session overwrites the same key."""
+    import boto3  # optional: only for the S3 target
+    body = gzip.compress(json.dumps({"format": "docus-s3-v1", "session_id": sid, "events": events},
+                                    separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    session = boto3.Session(profile_name=settings["profile"], region_name=settings["region"])
+    session.client("s3").put_object(Bucket=settings["bucket"], Key=key, Body=body, ContentType="application/json",
+                                    ContentEncoding="gzip", ChecksumAlgorithm="SHA256")
+    return "s3://" + settings["bucket"] + "/" + key
+
+
+def s3_settings(root):
+    path = find_config(root)
+    return load_config(path) if path else None
+
+
 def pytest_addoption(parser):
     group = parser.getgroup("test-recorder")
     group.addoption("--recorder-url", default=None, help="Test Recorder service URL")
@@ -147,11 +217,18 @@ def nodeid_identity(nodeid, root, repository):
 def pytest_configure(config):
     config.addinivalue_line("markers", "record_id(value): stable case name for recorder identity")
     url = config.getoption("--recorder-url") or os.getenv("TEST_RECORDER_URL")
-    if url:
+    try:
+        s3 = s3_settings(Path(str(config.rootpath)))
+    except (OSError, ValueError) as error:
+        warnings.warn("Test Recorder: S3 settings ignored: " + str(error))
+        s3 = None
+    if s3 and "http" not in s3["targets"]:
+        url = None  # the config says S3 only
+    if url or s3:
         if hasattr(config, "workerinput"):
             config.pluginmanager.register(WorkerMetadataPlugin(config), "test-recorder-worker-metadata")
         else:
-            config.pluginmanager.register(RecorderPlugin(config, url), "test-recorder-client-active")
+            config.pluginmanager.register(RecorderPlugin(config, url, s3), "test-recorder-client-active")
 
 
 class WorkerMetadataPlugin:
@@ -169,10 +246,12 @@ class WorkerMetadataPlugin:
 
 
 class RecorderPlugin:
-    def __init__(self, config, url):
+    def __init__(self, config, url, s3=None):
         self.root = Path(str(config.rootpath)).resolve()
         self.repository = repository_id(self.root, config.getoption("--recorder-repo"))
         self.url = url
+        self.s3 = s3
+        self.s3_result = None
         self.token = os.getenv("TEST_RECORDER_API_TOKEN")
         configured_timeout = config.getoption("--recorder-timeout")
         self.timeout = request_timeout(configured_timeout if configured_timeout is not None
@@ -308,6 +387,22 @@ class RecorderPlugin:
         self.events.append({"type": "session_finish", "sid": self.sid,
                             "finished_at": timestamp(), "exit_code": int(exitstatus),
                             "collected": collected})
+        if getattr(self, "s3", None):
+            key = s3_key(self.s3["prefix"], self.repository, self.events[0]["started_at"], self.sid)
+            try:
+                self.s3_result = put_session_s3(self.s3, key, self.sid, self.events)
+            except Exception as error:
+                self.s3_result = None
+                self.error = "S3: " + str(error)
+                try:
+                    target = self.spool / (self.sid + "-s3-" + str(uuid4()) + ".json")
+                    write_spool(target, {"format": "docus-spool-v2", "target": "s3", "session_id": self.sid,
+                                         "s3_key": key, "chunks": chunk_events(self.events)})
+                    warnings.warn("Test Recorder S3 upload failed; saved " + str(target) + ": " + str(error))
+                except OSError as spool_error:
+                    warnings.warn("Test Recorder S3 upload and spooling failed: " + str(error) + "; " + str(spool_error))
+        if not self.url:
+            return
         chunks = chunk_events(self.events)
         for index, payload in enumerate(chunks):
             try:
@@ -327,6 +422,8 @@ class RecorderPlugin:
 
     def pytest_terminal_summary(self, terminalreporter):
         terminalreporter.write_line("Test Recorder session: " + self.sid)
+        if getattr(self, "s3_result", None):
+            terminalreporter.write_line("Test Recorder: saved to " + self.s3_result)
         if self.error:
             terminalreporter.write_line("Test Recorder delivery failed: " + self.error)
 
@@ -336,13 +433,25 @@ def resend_main(argv=None):
     parser.add_argument("--url", default=os.getenv("TEST_RECORDER_URL"))
     parser.add_argument("--spool", default=os.getenv("TEST_RECORDER_SPOOL_DIR", ".test-recorder/spool"))
     parser.add_argument("--timeout", type=float, default=os.getenv("TEST_RECORDER_TIMEOUT", DEFAULT_TIMEOUT))
+    parser.add_argument("--config", help="docus.conf with the S3 settings (default: found from the current folder)")
     args = parser.parse_args(argv)
-    if not args.url:
-        parser.error("Set --url or TEST_RECORDER_URL")
     timeout = request_timeout(args.timeout)
+    s3 = None
     for path in sorted(Path(args.spool).glob("*.json")):
         payload = json.loads(path.read_text(encoding="utf-8"))
         chunks = payload["chunks"] if "chunks" in payload else chunk_events(payload["events"])
+        if payload.get("target") == "s3":
+            if s3 is None:
+                found = Path(args.config) if args.config else find_config(Path.cwd())
+                s3 = load_config(found) if found else None
+                if not s3:
+                    parser.error("S3 batches saved: set --config or DOCUS_CONFIG (docus.conf with s3_uri)")
+            events = [event for chunk in chunks for event in chunk["events"]]
+            print("Sent " + str(path) + " to " + put_session_s3(s3, payload["s3_key"], payload["session_id"], events))
+            path.unlink()
+            continue
+        if not args.url:
+            parser.error("Set --url or TEST_RECORDER_URL")
         for index, chunk in enumerate(chunks):
             post_batch(args.url, os.getenv("TEST_RECORDER_API_TOKEN"), chunk, timeout=timeout)
             if index + 1 < len(chunks):
