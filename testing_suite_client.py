@@ -348,6 +348,16 @@ class S3TargetTests(unittest.TestCase):
             self.assertEqual({e["status"] for e in body["events"] if e["type"] == "result"}, {"passed", "failed"})
             self.assertFalse((root / "spool").exists())
 
+    def test_recorder_off_turns_off_the_s3_target_too(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = self._setup(root)
+            result = self._run(root, dict(env, TEST_RECORDER="off"))
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertNotIn("saved to s3://", result.stdout)
+            self.assertFalse((root / "s3.log").exists())
+            self.assertFalse((root / "spool").exists())
+
     def test_failed_upload_is_spooled_then_resent(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

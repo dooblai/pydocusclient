@@ -216,6 +216,8 @@ def nodeid_identity(nodeid, root, repository):
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "record_id(value): stable case name for recorder identity")
+    if os.getenv("TEST_RECORDER", "").strip().lower() == "off":
+        return  # nothing recorded, to any target (the S3 config included)
     url = config.getoption("--recorder-url") or os.getenv("TEST_RECORDER_URL")
     try:
         s3 = s3_settings(Path(str(config.rootpath)))

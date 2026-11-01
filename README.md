@@ -90,4 +90,5 @@ aws_profile = my-profile              # optional: a profile in ~/.aws (boto3 rea
 Each pytest session becomes one gzipped JSON object (`{"format": "docus-s3-v1", "session_id": ..., "events": [...]}`)
 at `<path>/sessions/repo=<repo>/date=<YYYY-MM-DD>/<time>_<session id>.json.gz` (partitions Athena understands); S3
 checks the upload's SHA-256. Needs `boto3` (`pip install "docus[s3]"`). A failed upload is saved in the spool folder and
-sent by `pydocus-resend` (the same config is found from the current folder, or `--config`).
+sent by `pydocus-resend` (the same config is found from the current folder, or `--config`). `TEST_RECORDER=off`
+records nothing, to any target.
